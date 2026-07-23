@@ -1,8 +1,8 @@
 # 微信养号自动化系统
 
-> **技术路线**: uiautomator2 + Python + ADB + OpenCV + EasyOCR，纯手机端真机操作。定位策略为坐标 + 截图 + OpenCV + OCR 混合方案（因微信 FLAG_SECURE 屏蔽 UiAutomation 控件树）。
+> **目标**: 在真实 Android 手机上自动模拟真人使用微信，批量养出 L1~L4 级别的深度使用微信号，用于手机性能 benchmark 测试。
 >
-> **目标**: 批量养出 L1~L4 级别的深度使用微信号，用于性能 benchmark 测试。
+> **技术路线**: uiautomator2 + Python + ADB + OpenCV + EasyOCR，纯手机端真机操作。定位策略为坐标 + 截图 + OpenCV + OCR 混合方案（因微信 FLAG_SECURE 屏蔽 UiAutomation 控件树）。
 >
 > **详细方案**: 参见上级目录 [`具体执行方案.md`](../具体执行方案.md)（架构设计、实施路线图、功能状态清单）。
 
