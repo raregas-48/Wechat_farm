@@ -1,0 +1,467 @@
+"""
+朋友圈自动发布模块 — OCR + OpenCV + ADBKeyboard IME 混合识别方案
+==================================================================
+
+## 概述
+
+本模块实现微信朋友圈的全自动发布流程。由于微信屏蔽了 UiAutomation 控件树，
+所有界面定位均通过 **截图 + OCR 文字识别 + OpenCV 图像匹配** 完成，
+文字输入通过 **ADBKeyboard IME 静默注入**（不弹键盘、不乱码）。
+
+## 工作流
+
+::
+
+    导航到朋友圈
+      │
+      ├─[1] OpenCV 模板匹配 "相机" 图标 ──→ 点击右上角相机
+      │     └─ 多尺度模板匹配 (0.7x~1.2x)，失败时多坐标 fallback
+      │
+      ├─[2] OCR 识别 "从手机相册选择" ──→ 点击
+      │     └─ EasyOCR 扫描下半屏菜单区域，关键词匹配
+      │
+      ├─[3] OpenCV Canny 边缘检测 ──→ 点击指定照片
+      │     └─ 检测缩略图网格，按行列排序，支持多选
+      │
+      ├─[4] OCR 识别 "完成" 按钮 ──→ 点击进入编辑页
+      │     └─ 扫描右下角区域，匹配 "完成(N)"
+      │
+      ├─[5] OCR 识别 "这一刻的想法..." 占位文字 ──→ 点击激活输入框
+      │     └─ CLAHE 增强低对比度文字后 OCR，ADBKeyboard IME send_keys
+      │
+      └─[6] OCR 识别 "发表" 按钮 ──→ 点击发送
+            └─ 扫描右上角区域，验证返回朋友圈页面
+
+## 快速开始
+
+.. code-block:: python
+
+    from core.moment_poster import MomentPoster
+
+    poster = MomentPoster(device, account_id="wx_001")
+    poster.post(text="今天天气真好", photo_count=2)
+
+## CLI 测试
+
+.. code-block:: bash
+
+    python test_post_moment.py --text "hello" --count 1
+    python test_post_moment.py --cmd "前两张照片发送并配文字 raregas"
+
+## 依赖
+
+- **EasyOCR** (ch_sim + en): 文字识别，首次运行需下载模型 (~100MB)
+- **OpenCV**: 模板匹配、边缘检测、图像预处理
+- **ADBKeyboard IME**: uiautomator2 内置，首次使用自动安装
+- **PyTorch**: EasyOCR 后端 (CPU 模式)
+
+## 适配
+
+当前基于 **Moto X70 Air Pro (1264x2780, Android 14)** 校准。
+换设备需更新:
+  - ``screenshots/template_camera_*.png`` — 相机图标模板截图
+  - ``_click_publish()`` / ``_click_done()`` 中的 fallback 坐标
+"""
+
+import time
+import random
+import cv2
+import numpy as np
+from pathlib import Path
+
+from utils.logger import get_logger
+
+logger = get_logger("moment_poster")
+
+
+class MomentPoster:
+    """朋友圈自动发布器。"""
+
+    def __init__(self, d, account_id: str = ""):
+        self.d = d
+        self.account_id = account_id
+        self.w, self.h = d.info['displayWidth'], d.info['displayHeight']
+
+        # 延迟加载
+        self._ocr = None
+        self._clahe = None
+
+    # ================================================================
+    # 公共接口
+    # ================================================================
+
+    def post(self, text: str, photo_index: int = 0, photo_count: int = 1) -> bool:
+        """
+        发朋友圈。
+
+        Args:
+            text:        朋友圈文案
+            photo_index: 起始照片序号，0=第一张
+            photo_count: 选几张照片
+
+        Returns:
+            是否成功
+        """
+        logger.info(f"[{self.account_id}] 发朋友圈: text='{text[:20]}...', "
+                     f"photos={photo_count}")
+
+        try:
+            self._navigate_to_moments()
+            self._click_camera()
+            self._click_album_option()
+            self._select_photos(photo_index, photo_count)
+            self._click_done()
+            self._input_text(text)
+            self._click_publish()
+            logger.info(f"[{self.account_id}] 朋友圈发送成功")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.account_id}] 发朋友圈失败: {e}")
+            return False
+
+    # ================================================================
+    # 导航
+    # ================================================================
+
+    def _navigate_to_moments(self):
+        """冷启动微信 → 发现 → 朋友圈 → 顶部。"""
+        logger.debug(f"[{self.account_id}] 导航到朋友圈...")
+        d, w, h = self.d, self.w, self.h
+
+        d.screen_on()
+        time.sleep(0.3)
+        d.swipe(w // 2, int(h * 0.85), w // 2, int(h * 0.2), duration=0.3)
+        time.sleep(0.5)
+        d.app_stop("com.tencent.mm")
+        time.sleep(1)
+        d.app_start("com.tencent.mm")
+        time.sleep(5)
+
+        d.click(int(w * 0.625), int(h * 0.955))   # 发现 tab
+        time.sleep(2)
+        d.click(int(w * 0.32), int(h * 0.131))      # 朋友圈入口
+        time.sleep(3)
+        d.swipe(w // 2, int(h * 0.3), w // 2, int(h * 0.7), duration=0.3)
+        time.sleep(2)
+
+    # ================================================================
+    # 阶段1: OpenCV 模板匹配相机
+    # ================================================================
+
+    def _click_camera(self):
+        """OpenCV 模板匹配相机图标 → 点击。"""
+        logger.debug(f"[{self.account_id}] 阶段1: 匹配相机图标")
+        d, w, h = self.d, self.w, self.h
+
+        img = np.array(d.screenshot(format="pillow"))
+        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        search = g[80:250, 950:min(1264, w)]
+
+        best_match, best_val = None, 0
+        template_dir = Path("screenshots")
+        for tpl_name in ["template_camera_icon.png", "template_camera_980.png",
+                          "template_camera_1000.png"]:
+            tpl_path = template_dir / tpl_name
+            if not tpl_path.exists():
+                continue
+            tpl = cv2.imread(str(tpl_path), cv2.IMREAD_GRAYSCALE)
+            if tpl is None:
+                continue
+            for scale in [0.7, 0.8, 0.9, 1.0, 1.1, 1.2]:
+                sw, sh = int(tpl.shape[1] * scale), int(tpl.shape[0] * scale)
+                if sw < 10 or sh < 10 or sw > search.shape[1] or sh > search.shape[0]:
+                    continue
+                resized = cv2.resize(tpl, (sw, sh))
+                result = cv2.matchTemplate(search, resized, cv2.TM_CCOEFF_NORMED)
+                _, mv, _, ml = cv2.minMaxLoc(result)
+                if mv > best_val:
+                    best_val = mv
+                    best_match = {"x": ml[0] + sw // 2 + 950,
+                                  "y": ml[1] + sh // 2 + 80,
+                                  "score": mv}
+
+        if best_match and best_match["score"] > 0.4:
+            cx, cy = best_match["x"], best_match["y"]
+            logger.debug(f"[{self.account_id}] 相机匹配: ({cx},{cy}) score={best_match['score']:.2f}")
+        else:
+            cx, cy = int(w * 0.862), int(h * 0.054)
+            logger.debug(f"[{self.account_id}] 相机 fallback: ({cx},{cy})")
+
+        d.click(cx, cy)
+        time.sleep(2)
+
+        # 重试验证
+        if not self._is_dimmed():
+            for rx, ry in [(0.893, 0.055), (0.870, 0.054)]:
+                d.click(int(w * rx), int(h * ry))
+                time.sleep(2)
+                if self._is_dimmed():
+                    break
+                d.press("back")
+                time.sleep(0.3)
+
+    # ================================================================
+    # 阶段2: OCR 识别"从相册选择"
+    # ================================================================
+
+    def _click_album_option(self):
+        """OCR 识别菜单中的'从相册选择' → 点击。"""
+        logger.debug(f"[{self.account_id}] 阶段2: OCR识别相册选项")
+        d, h = self.d, self.h
+
+        img = np.array(d.screenshot(format="pillow"))
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        results = self._ocr_region(img_bgr, 0, int(h * 0.48), self.w, h)
+        album_targets = ["从相册选择", "从手机相册选择", "相册选择", "手机相册"]
+
+        best = None
+        for bbox, text, conf in results:
+            for tgt in album_targets:
+                if tgt in text:
+                    cx = int((bbox[0][0] + bbox[2][0]) / 2)
+                    cy = int((bbox[0][1] + bbox[2][1]) / 2)
+                    if cy > h * 0.5:
+                        best = (cx, cy)
+                        break
+            if best:
+                break
+
+        if best:
+            logger.debug(f"[{self.account_id}] 相册选项: ({best[0]},{best[1]})")
+            d.click(*best)
+        else:
+            logger.warning(f"[{self.account_id}] OCR未找到相册选项，fallback")
+            d.click(int(self.w * 0.5), int(h * 0.87))
+
+        time.sleep(3)
+
+    # ================================================================
+    # 阶段3: OpenCV 选照片
+    # ================================================================
+
+    def _select_photos(self, photo_index: int = 0, count: int = 1):
+        """OpenCV Canny边缘检测 → 选照片。"""
+        logger.debug(f"[{self.account_id}] 阶段3: 选{count}张照片(从#{photo_index+1}起)")
+        d, w, h = self.d, self.w, self.h
+
+        time.sleep(3)
+
+        img = np.array(d.screenshot(format="pillow"))
+        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+        album = g[180:int(h * 0.78), :]
+        edges = cv2.Canny(cv2.GaussianBlur(album, (5, 5), 0), 25, 80)
+        edges = cv2.dilate(edges, np.ones((4, 4), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        photos = []
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            ar = cw / ch if ch > 0 else 0
+            if 60 < cw < 500 and 60 < ch < 500 and 0.5 < ar < 2.0:
+                if 500 < cw * ch < 150000:
+                    photos.append({"cx": x + cw // 2, "cy": y + 180 + ch // 2})
+
+        photos.sort(key=lambda p: (p["cy"], p["cx"]))
+        logger.debug(f"[{self.account_id}] 检测到{len(photos)}个缩略图")
+
+        selected = 0
+        for i in range(photo_index, min(photo_index + count, len(photos))):
+            p = photos[i]
+            d.click(p["cx"], p["cy"])
+            time.sleep(0.4)
+            selected += 1
+
+        # fallback
+        if selected < count:
+            fallback = [(0.158, 0.180), (0.158, 0.200), (0.475, 0.180),
+                         (0.475, 0.200), (0.120, 0.180)]
+            for i in range(selected, min(count, len(fallback))):
+                d.click(int(w * fallback[i][0]), int(h * fallback[i][1]))
+                time.sleep(0.4)
+
+    # ================================================================
+    # 阶段4: OCR 识别"完成"
+    # ================================================================
+
+    def _click_done(self):
+        """OCR 识别'完成'按钮 → 点击。"""
+        logger.debug(f"[{self.account_id}] 阶段4: 识别完成按钮")
+        d, w, h = self.d, self.w, self.h
+        time.sleep(0.5)
+
+        img = np.array(d.screenshot(format="pillow"))
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        results = self._ocr_region(img_bgr, int(w * 0.50), int(h * 0.85), w, h)
+
+        done_pos = None
+        for bbox, text, conf in results:
+            if "完成" in text and conf > 0.2:
+                cx = int((bbox[0][0] + bbox[2][0]) / 2)
+                cy = int((bbox[0][1] + bbox[2][1]) / 2)
+                done_pos = (cx, cy)
+                break
+
+        if done_pos:
+            d.click(*done_pos)
+        else:
+            d.click(int(w * 0.90), int(h * 0.95))
+
+        time.sleep(3)
+
+    # ================================================================
+    # 阶段5: IME 注入文字
+    # ================================================================
+
+    def _input_text(self, text: str):
+        """OCR定位输入区 + ADBKeyboard IME 注入文字。"""
+        logger.debug(f"[{self.account_id}] 阶段5: 输入文字 '{text[:20]}...'")
+        d, w, h = self.d, self.w, self.h
+
+        # 5a. 切换到 ADBKeyboard IME
+        try:
+            d.set_input_ime(True)
+            time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] set_input_ime 失败: {e}")
+
+        # 5b. OCR 找占位文字
+        img = np.array(d.screenshot(format="pillow"))
+        gray_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        enhanced = self._clahe_enhance(gray_img)
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        results = self._ocr_region(enhanced_bgr, 0, int(h * 0.06), w, int(h * 0.35))
+
+        placeholder_kw = ["这一刻的想法", "这一刻", "说说这一刻", "此刻的想法",
+                           "这一刻想说", "这一刻的"]
+        input_pos = None
+        for bbox, vtext, conf in results:
+            for kw in placeholder_kw:
+                if kw in vtext:
+                    cx = int((bbox[0][0] + bbox[2][0]) / 2)
+                    cy = int((bbox[0][1] + bbox[2][1]) / 2)
+                    input_pos = (cx, cy)
+                    break
+            if input_pos:
+                break
+
+        if input_pos:
+            d.click(*input_pos)
+        else:
+            d.click(int(w * 0.50), int(h * 0.25))
+
+        time.sleep(0.8)
+
+        # 5c. IME 注入
+        try:
+            d.clear_text()
+            time.sleep(0.2)
+        except Exception:
+            pass
+
+        try:
+            d.send_keys(text)
+            time.sleep(0.8)
+            logger.debug(f"[{self.account_id}] send_keys 完成")
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] send_keys 异常: {e}")
+            for char in text:
+                try:
+                    d.send_keys(char)
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+
+        # 5d. 恢复 IME
+        try:
+            d.set_input_ime(False)
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    # ================================================================
+    # 阶段6: OCR 识别"发表"
+    # ================================================================
+
+    def _click_publish(self):
+        """OCR 识别'发表'按钮 → 点击。"""
+        logger.debug(f"[{self.account_id}] 阶段6: 识别发表按钮")
+        d, w, h = self.d, self.w, self.h
+
+        img = np.array(d.screenshot(format="pillow"))
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        results = self._ocr_region(img_bgr, int(w * 0.60), 0, w, int(h * 0.22))
+
+        publish_pos = None
+        for bbox, text, conf in results:
+            if "发表" in text and conf > 0.2:
+                cx = int((bbox[0][0] + bbox[2][0]) / 2)
+                cy = int((bbox[0][1] + bbox[2][1]) / 2)
+                publish_pos = (cx, cy)
+                break
+
+        if publish_pos:
+            d.click(*publish_pos)
+        else:
+            for rx, ry in [(0.880, 0.056), (0.890, 0.055)]:
+                d.click(int(w * rx), int(h * ry))
+                time.sleep(1)
+                if self._is_moments_page():
+                    break
+
+        time.sleep(4)
+
+    # ================================================================
+    # 工具方法
+    # ================================================================
+
+    def _is_dimmed(self):
+        """检测是否弹出了暗色遮罩（菜单已打开）。"""
+        img = np.array(self.d.screenshot(format="pillow"))
+        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        center = g[int(self.h * 0.60):int(self.h * 0.80),
+                     int(self.w * 0.20):int(self.w * 0.80)]
+        return np.mean(center) < 170
+
+    def _is_moments_page(self):
+        """检测是否在朋友圈页面。"""
+        img = np.array(self.d.screenshot(format="pillow"))
+        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        if self._is_dimmed():
+            return False
+        return np.mean(g[80:250, :]) > 120
+
+    def _clahe_enhance(self, gray_img):
+        """CLAHE 增强低对比度文字。"""
+        if self._clahe is None:
+            self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        return self._clahe.apply(gray_img)
+
+    def _get_ocr(self):
+        """获取 EasyOCR 实例（延迟加载）。"""
+        if self._ocr is None:
+            import easyocr
+            self._ocr = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+        return self._ocr
+
+    def _ocr_region(self, img_bgr, x0, y0, x1, y1):
+        """对指定区域做 OCR，返回全局坐标结果。"""
+        h_img, w_img = img_bgr.shape[:2]
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(w_img, x1)
+        y1 = min(h_img, y1)
+        if x0 >= x1 or y0 >= y1:
+            return []
+
+        crop = img_bgr[y0:y1, x0:x1]
+        reader = self._get_ocr()
+        results = reader.readtext(crop)
+
+        global_results = []
+        for bbox, text, conf in results:
+            global_bbox = [[p[0] + x0, p[1] + y0] for p in bbox]
+            global_results.append((global_bbox, text, conf))
+        return global_results

@@ -1,0 +1,33 @@
+# 微信养号自动化系统 — Python 依赖
+#
+# 安装方式:
+#   pip install -r requirements.txt
+#
+# 核心依赖：
+#   uiautomator2  — 手机 UI 自动化控制（Android UiAutomation API）
+#   loguru        — 日志（替代标准库 logging）
+#   apscheduler   — 定时任务调度
+#   openai        — LLM API 调用（DeepSeek 兼容 OpenAI SDK）
+#   Pillow        — 截图处理
+#   opencv-python — 图像匹配/模板匹配（相机图标定位、边缘检测）
+#   easyocr       — OCR 文字识别（菜单按钮、发表按钮定位）
+#   torch         — EasyOCR 后端（CPU 模式）
+#   requests      — HTTP 请求（钉钉 Webhook 通知）
+
+# ===== 核心（必装）=====
+uiautomator2>=2.16.0
+loguru>=0.7.0
+apscheduler>=3.10.0
+openai>=1.0.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+easyocr>=1.7.0
+torch>=2.0.0
+requests>=2.28.0
+
+# ===== 可选 =====
+numpy>=1.24.0              # 拟人化引擎数值计算
+prometheus-client>=0.18.0  # Prometheus 指标上报
+
+# ===== 开发工具 =====
+weditor>=0.7.0             # uiautomator2 配套元素查看器（调试必备）

@@ -1,0 +1,18 @@
+wechat_env/
+__pycache__/
+*.pyc
+*.db
+logs/
+screenshots/
+data/
+py测试/
+.vscode/
+.idea/
+*.pyo
+.DS_Store
+Thumbs.db
+
+# 汇报和文档（不上传）
+*.pptx
+*.lnk
+进度汇报/
