@@ -5,6 +5,8 @@
 > **技术路线**: uiautomator2 + Python + ADB + OpenCV + EasyOCR，纯手机端真机操作。定位策略为坐标 + 截图 + OpenCV + OCR 混合方案（因微信 FLAG_SECURE 屏蔽 UiAutomation 控件树）。
 >
 > **详细方案**: 参见 [`具体执行方案.md`](具体执行方案.md)（架构设计、实施路线图、功能状态清单）。
+>
+> **使用手册**: 参见 [`使用手册.md`](使用手册.md)（新增设备、更换服务器、日常运维、修改剧本等操作指南）。
 
 ---
 
@@ -28,133 +30,34 @@
 ### 2.1 环境搭建
 
 ```bash
-# 1. 进入项目目录
 cd wechat_farm
-
-# 2. 创建虚拟环境
 python -m venv wechat_env
-wechat_env\Scripts\activate   # Windows
-# source wechat_env/bin/activate  # macOS / Linux
-
-# 3. 安装依赖
+wechat_env\Scripts\activate        # Windows
 pip install -r requirements.txt
-
-# 4. 手机端配置
-#    a) 开启开发者模式 → USB 调试 → 不锁定屏幕
-#    b) USB 连接电脑，手机上点"允许 USB 调试"
-#    c) 安装 uiautomator2 agent 到手机：
-python -m uiautomator2 init
-
-# 5. 初始化项目
-python main.py init
+python -m uiautomator2 init        # 手机上装 agent
+python main.py init                # 初始化数据库
 ```
 
 ### 2.2 验证连通性
 
 ```bash
-# 确认 ADB 识别到手机
-adb devices
-# 预期输出:  XXXXXXXX    device
-
-# 启动 weditor 查看微信控件树（开发调试必备）
-python -m weditor
-# 浏览器打开 http://localhost:17310，连接设备后查看控件树
+adb devices                        # 看到设备序列号即正常
+python main.py fast-debug          # 一键跑通全部功能（约20min）
 ```
 
-### 2.3 调试模式（先人工操作看是否有bug）
+### 2.3 服务器部署
 
 ```bash
-# 快速调试：一键跑通全部核心功能（约20分钟）
-#   ① 发朋友圈(1张图)  ② 朋友圈点赞+评论  ③ 发送文字
-#   ④ 发送图片        ⑤ 刷视频号(3min)    ⑥ 阅读公众号(2min)
-#   ⑦ 浏览收藏夹(1min)
-# 联系人配置: 编辑 scripts/fast_test.py 顶部 CONTACT_NAME
-python main.py fast-debug
-
-# 完整调试：单设备执行一次当天养号剧本（按时间窗口调度）
-python main.py debug
-```
-
-### 2.4 服务器自动化部署
-
-完成前三步后，配置定时任务让系统每天自动运行。
-
-#### 2.4.1 一次性配置
-
-服务器上可能有多台设备，为避免干扰，此处手动完成：
-
-```bash
-# 1. 手动建库
-python -c "from storage.db import Database; db = Database('wechat_farm.db'); db.init_db()"
-
-# 2. 录入账号（替换为实际的序列号和注册日期）
-python -c "
-from storage.db import Database
-db = Database('wechat_farm.db')
-db.insert_account(id='acc_001', device_serial='N0URB40116', registration_date='2026-07-01', batch_name='batch_a', persona_id='p01')
-db.bind_device(serial='N0URB40116', account_id='acc_001')
-"
-
-# 3. 验证（只操作指定设备）
-python -c "
-import uiautomator2 as u2
-d = u2.connect('N0URB40116')
-d.app_start('com.tencent.mm')
-print('OK')
-"
-```
-
-> 多台手机时，每台重复步骤 2~3 即可。
-
-#### 2.4.2 设置定时任务
-
-**Windows（任务计划程序）：**
-
-```powershell
-# 每天早上 7:00 执行当日养号剧本
-schtasks /create /tn "WechatFarm_Daily" /tr "d:\养微信号\wechat_farm\wechat_env\Scripts\python.exe d:\养微信号\wechat_farm\main.py run" /sc daily /st 07:00
-
-# 每周一推进阶段
-schtasks /create /tn "WechatFarm_Advance" /tr "d:\养微信号\wechat_farm\wechat_env\Scripts\python.exe d:\养微信号\wechat_farm\main.py advance" /sc weekly /d MON /st 08:00
-```
-
-**Linux（Cron）：**
-
-```bash
+# 1. 手动建库 + 录入账号 + 验证（详见使用手册）
+# 2. 设置 Cron 定时任务
 crontab -e
-0 7 * * * cd /path/to/wechat_farm && ./wechat_env/bin/python main.py run >> logs/cron.log 2>&1
-0 8 * * 1 cd /path/to/wechat_farm && ./wechat_env/bin/python main.py advance >> logs/cron.log 2>&1
+0 7 * * * cd ~/wechat_farm && ./wechat_env/bin/python main.py run >> logs/cron.log 2>&1
+0 8 * * 1 cd ~/wechat_farm && ./wechat_env/bin/python main.py advance >> logs/cron.log 2>&1
+
+# 3. 启动 Agent 监控（详见使用手册）
 ```
 
-#### 2.4.3 启动 Agent 监控
-
-完成 2.4.2 后，需**手动**对 Agent 发以下指令，激活 24h 监控：
-
-**第 1 步：让 Agent 阅读项目规则**
-
-```
-请阅读 wechat_farm/CLAUDE.md，你现在是本项目的上层调度员，24h 辅助项目运行。
-```
-
-**第 2 步：设置定时检查（逐条发送）**
-
-```
-设置每天早上 7:05 检查昨晚日志，有失败动作通知我
-设置每天晚上 22:00 生成今日报告总结
-设置每 4 小时检查 adb devices，设备离线通知我
-```
-
----
-
-完成以上两步后，你的自动化系统架构：
-
-```
-Windows 任务计划（07:00 自动执行剧本）
-       +
-Agent 定时监控（07:05 / 22:00 / 每4h 检查日志和设备）
-       =
-完整的 24h 无人值守自动化
-```
+> 服务器上有其他设备时，不要运行 `python main.py init`，会干扰其他设备。详细步骤参见 [`使用手册.md`](使用手册.md)。
 
 ---
 
@@ -176,70 +79,13 @@ Agent 定时监控（07:05 / 22:00 / 每4h 检查日志和设备）
 
 ---
 
-## 四、账号录入
-
-在数据库中录入账号信息（首次使用需要）：
-
-```python
-# 方式1: Python 交互式
-from storage.db import Database
-db = Database("wechat_farm.db")
-db.init_db()
-
-# 插入账号
-db.insert_account(
-    id="acc_001",
-    wechat_id="wxid_xxx",
-    device_serial="ABCD1234",       # adb devices 看到的序列号
-    registration_date="2026-07-01", # 注册日期
-    batch_name="batch_a",
-    persona_id="p01",
-    phone="138xxxx1234",
-)
-
-# 绑定设备
-db.bind_device(
-    serial="ABCD1234",
-    account_id="acc_001",
-    model="Moto G54",
-    android_version="14",
-)
-```
-
-```bash
-# 方式2: 直接用 SQLite
-sqlite3 wechat_farm.db
-
-INSERT INTO accounts (id, wechat_id, device_serial, registration_date, batch_name, persona_id)
-VALUES ('acc_001', 'wxid_xxx', 'ABCD1234', '2026-07-01', 'batch_a', 'p01');
-```
-
-### 录入好友
-
-剧本中的聊天动作会从 `friends` 表随机抽取联系人。需手动录入：
-
-```python
-db.add_friend(
-    account_id="acc_001",
-    friend_name="张三",           # 微信里的昵称或备注，聊天时用这个名字搜索
-    friend_wechat_id="wxid_xxx",  # 可选
-)
-```
-
-或 SQL：
-
-```sql
-INSERT INTO friends (account_id, friend_name) VALUES ('acc_001', '张三');
-```
-
----
-
-## 五、项目结构
+## 四、项目结构
 
 ```
 wechat_farm/
 ├── main.py                        # CLI 主入口
 ├── CLAUDE.md                      # Agent 调度配置（供上层 AI 阅读）
+├── 使用手册.md                    # 运维操作指南（新增设备、更换服务器等）
 ├── config/         # 配置: 全局参数、阶段规则、元素定位字典
 ├── core/           # 核心(15个模块): 微信操作、OCR识别、拟人化引擎
 │   ├── wechat_control.py          # ← 统一调用入口
@@ -262,7 +108,7 @@ wechat_farm/
 
 ---
 
-## 六、养号四阶段
+## 五、养号四阶段
 
 | 阶段 | 时长 | 核心行为 | 每日限量 |
 |------|------|---------|---------|
@@ -273,7 +119,7 @@ wechat_farm/
 
 ---
 
-## 七、已实现功能
+## 六、已实现功能
 
 | 类别 | 已实现 |
 |------|--------|
@@ -283,12 +129,12 @@ wechat_farm/
 | 公众号 | 阅读文章、收藏文章 |
 | 搜索 | 全局搜索 |
 | 收藏夹 | 浏览 |
-| 系统 | 支付页面、设备健康检查(12项)、账号健康检查(6项)、行为日志 |
+| 系统 | 设备健康检查(12项)、账号健康检查(6项)、行为日志 |
 
 
 ---
 
-## 八、环境变量（可选）
+## 七、环境变量（可选）
 
 ```bash
 # LLM API（用 AI 生成聊天内容/朋友圈文案）
@@ -301,9 +147,9 @@ set DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=xxx
 
 ---
 
-## 九、调试技巧
+## 八、调试技巧
 
-### 9.1 单步操作验证
+### 8.1 单步操作验证
 
 ```python
 import uiautomator2 as u2
@@ -316,7 +162,7 @@ d(text="朋友圈").exists       # True → 定位成功
 d(text="朋友圈").click()
 ```
 
-### 9.2 直接调用核心模块
+### 8.2 直接调用核心模块
 
 ```python
 from core.wechat_control import WeChatControl
@@ -337,7 +183,7 @@ wc.browse_favorites(120)                      # 浏览收藏夹
 wc.global_search("天气")                      # 全局搜索
 ```
 
-### 9.3 查看运行日志
+### 8.3 查看运行日志
 
 ```bash
 # 日志文件
@@ -347,7 +193,7 @@ tail -f logs/wechat_farm_*.log
 tail -f logs/error_*.log
 ```
 
-### 9.4 查看数据库
+### 8.4 查看数据库
 
 ```bash
 # 查看今日操作
@@ -362,7 +208,7 @@ sqlite3 wechat_farm.db "SELECT id, stage, state, mode FROM accounts;"
 
 ---
 
-## 十、常见问题
+## 九、常见问题
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
@@ -374,8 +220,4 @@ sqlite3 wechat_farm.db "SELECT id, stage, state, mode FROM accounts;"
 | 微信更新后定位全部失效 | resourceId 变化 | weditor 重新抓取，更新定位字典 |
 | EasyOCR 首次运行慢 | 下载模型 ~100MB | 仅首次，后续使用缓存 |
 
----
 
-> **项目版本**: v2.4 | **创建日期**: 2026-07-10 | **更新**: 2026-07-23
-> **技术路线**: uiautomator2 + Python + ADB + OpenCV + EasyOCR（坐标/控件/截图/OCR 混合定位）
-> **测试设备**: Moto X70 Air Pro (1264×2780, Android 14) | **测试账号**: 稀有气体
